@@ -1,0 +1,50 @@
+name: Python CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  basic-checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install Package
+        run: python -m pip install -e .
+
+      - name: Compile Python Files
+        run: |
+          python -m py_compile \
+            main.py \
+            login.py \
+            run_image_tasks.py \
+            src/config.py \
+            src/core/client.py \
+            src/core/diagnostics.py \
+            src/core/image_jobs.py \
+            src/core/quality.py \
+            src/db/manager.py \
+            src/prompts/markdown_prompts.py \
+            src/prompts/section_style.py \
+            src/utils/exporter.py \
+            src/utils/mermaid.py
+
+      - name: Check CLI Help
+        run: |
+          entropy-note --help
+          entropy-note-login --help
+          entropy-note-image-tasks --help

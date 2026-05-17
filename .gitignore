@@ -16,6 +16,10 @@ study_guide.db
 outputs/
 my_study_materials/
 .notebooklm/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
 
 # OS generated files
 .DS_Store
@@ -38,4 +42,3 @@ logs/
 
 # Playwright browsers (if applicable)
 .playwright/
-
