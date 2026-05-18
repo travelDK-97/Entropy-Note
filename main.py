@@ -112,7 +112,14 @@ def _filter_results_by_outline(results: list, outline: list) -> list:
     ]
 
 
-def export_all_views(db: DatabaseManager, notebook_title: str, outline: list, *, is_final: bool):
+def export_all_views(
+    db: DatabaseManager,
+    notebook_title: str,
+    outline: list,
+    *,
+    is_final: bool,
+    reference_sources: list[dict] | None = None,
+):
     repaired = db.repair_structured_fallbacks(notebook_title)
     if repaired:
         logger.info(f"已自动修复 {repaired} 个历史结构化回退结果，并重新导出。")
@@ -130,18 +137,38 @@ def export_all_views(db: DatabaseManager, notebook_title: str, outline: list, *,
         results,
         is_final=is_final,
         structured_sections=structured_sections,
+        reference_sources=reference_sources,
     )
 
     if structured_sections:
         export_cheatsheets(notebook_title, structured_sections, is_final=is_final)
-        export_cheatsheets_by_chapter(notebook_title, structured_sections, is_final=is_final)
+        export_cheatsheets_by_chapter(
+            notebook_title,
+            structured_sections,
+            is_final=is_final,
+            reference_sources=reference_sources,
+        )
         export_structured_blocks(notebook_title, structured_sections, is_final=is_final)
-        export_structured_blocks_by_chapter(notebook_title, structured_sections, is_final=is_final)
+        export_structured_blocks_by_chapter(
+            notebook_title,
+            structured_sections,
+            is_final=is_final,
+            reference_sources=reference_sources,
+        )
         export_renderable_visuals(notebook_title, structured_sections, is_final=is_final)
-        export_renderable_visuals_by_chapter(notebook_title, structured_sections, is_final=is_final)
+        export_renderable_visuals_by_chapter(
+            notebook_title,
+            structured_sections,
+            is_final=is_final,
+            reference_sources=reference_sources,
+        )
         quality_report = validate_structured_sections(structured_sections, notebook_title=notebook_title)
         export_quality_report(notebook_title, quality_report)
-        export_quality_report_by_chapter(notebook_title, quality_report)
+        export_quality_report_by_chapter(
+            notebook_title,
+            quality_report,
+            reference_sources=reference_sources,
+        )
         summary = quality_report.get("summary", {})
         logger.info(
             "质量校验摘要: "
@@ -153,9 +180,19 @@ def export_all_views(db: DatabaseManager, notebook_title: str, outline: list, *,
         publish_gate = None
         if _is_publish_exports_enabled():
             export_comic_prompts(notebook_title, structured_sections, is_final=is_final)
-            export_comic_prompts_by_chapter(notebook_title, structured_sections, is_final=is_final)
+            export_comic_prompts_by_chapter(
+                notebook_title,
+                structured_sections,
+                is_final=is_final,
+                reference_sources=reference_sources,
+            )
             export_image_tasks(notebook_title, structured_sections, is_final=is_final)
-            export_image_tasks_by_chapter(notebook_title, structured_sections, is_final=is_final)
+            export_image_tasks_by_chapter(
+                notebook_title,
+                structured_sections,
+                is_final=is_final,
+                reference_sources=reference_sources,
+            )
             publish_gate = evaluate_publish_gate(
                 quality_report,
                 min_average_score=PUBLISH_MIN_AVERAGE_SCORE,
@@ -184,6 +221,7 @@ def export_all_views(db: DatabaseManager, notebook_title: str, outline: list, *,
             include_comic_exports=_is_publish_exports_enabled(),
             include_image_exports=_is_publish_exports_enabled(),
             include_renderable_visuals=True,
+            reference_sources=reference_sources,
         )
         return quality_report
 
@@ -196,6 +234,7 @@ def export_all_views(db: DatabaseManager, notebook_title: str, outline: list, *,
         include_comic_exports=_is_publish_exports_enabled(),
         include_image_exports=_is_publish_exports_enabled(),
         include_renderable_visuals=True,
+        reference_sources=reference_sources,
     )
     return None
 
@@ -326,6 +365,7 @@ async def rerun_failed_quality_sections(
     outline: list,
     initial_quality_report: dict | None = None,
     max_attempts: int = QUALITY_REGEN_MAX_ATTEMPTS,
+    reference_sources: list[dict] | None = None,
 ) -> dict | None:
     quality_report = initial_quality_report or validate_structured_sections(
         db.get_structured_sections(notebook_title, outline=outline),
@@ -367,7 +407,13 @@ async def rerun_failed_quality_sections(
             if ok:
                 regenerated_count += 1
 
-        quality_report = export_all_views(db, notebook_title, outline, is_final=False)
+        quality_report = export_all_views(
+            db,
+            notebook_title,
+            outline,
+            is_final=False,
+            reference_sources=reference_sources,
+        )
         remaining = len(_get_quality_retry_sections(quality_report))
         logger.info(f"第 {attempt} 轮质量重生成结束，剩余 {remaining} 个仍含错误或警告的小节。")
 
@@ -389,6 +435,11 @@ def parse_args():
     parser.add_argument("--notebook-id", help="直接指定要处理的笔记本 ID")
     parser.add_argument("--notebook-title", help="直接指定要处理的笔记本标题")
     parser.add_argument("--notebook-index", type=int, help="直接指定笔记本列表序号（从 1 开始）")
+    parser.add_argument(
+        "--outline-mode",
+        choices=["core", "official_from_sources"],
+        help="大纲模式：`core` 为核心学习输出；`official_from_sources` 为优先按资源中的正式目录输出",
+    )
     parser.add_argument("--force-regenerate", action="store_true", help="即使小节已存在，也按当前提示词重新生成全部小节")
     parser.add_argument("--chapter-title", help="只处理指定章节标题")
     parser.add_argument("--chapter-index", type=int, help="只处理指定章节序号（从 1 开始）")
@@ -400,6 +451,28 @@ def parse_args():
 
 def _outline_section_count(outline: list) -> int:
     return sum(len(part.get("sections", []) or []) for part in outline or [])
+
+
+def resolve_outline_mode(preferred_mode: str | None = None) -> str:
+    if preferred_mode:
+        return preferred_mode
+
+    print("\n[大纲模式选择]")
+    print("1. 核心学习输出（默认）")
+    print("2. 按资源正式目录输出")
+    while True:
+        choice = input("\n👉 请选择大纲模式 [默认 1]: ").strip()
+        if choice in ("", "1"):
+            return "core"
+        if choice == "2":
+            return "official_from_sources"
+        print("请输入 1 或 2。")
+
+
+def get_outline_mode_label(outline_mode: str) -> str:
+    if outline_mode == "official_from_sources":
+        return "按资源正式目录输出"
+    return "核心学习输出"
 
 
 def select_outline_subset(
@@ -537,23 +610,35 @@ async def main():
             
         nb_id = notebook.id
         nb_title = notebook.title
+        outline_mode = resolve_outline_mode(args.outline_mode)
+        logger.info(f"当前大纲模式: {get_outline_mode_label(outline_mode)}")
+        notebook_metadata = await client.get_notebook_metadata(nb_id)
+        reference_sources = (notebook_metadata or {}).get("sources", [])
+        if reference_sources:
+            logger.info(f"已读取 {len(reference_sources)} 个参考文档来源，将写入索引目录。")
+        else:
+            logger.warning("暂未读取到参考文档来源，索引目录将只导出正文导航。")
 
         # 2. 提取或读取大纲
-        outline = db.get_outline(nb_title)
+        outline = db.get_outline(nb_title, outline_mode=outline_mode)
         if not outline:
-            logger.info("未找到大纲缓存，正在请求 AI 提取...")
-            outline = await client.extract_outline(nb_id)
+            logger.info(f"未找到大纲缓存，正在按模式提取大纲: {get_outline_mode_label(outline_mode)}")
+            outline = await client.extract_outline(
+                nb_id,
+                outline_mode=outline_mode,
+                reference_sources=reference_sources,
+            )
             if not outline:
                 logger.error("大纲提取失败，流程终止。")
                 return
             outline = enrich_outline_with_section_plans(outline, nb_title)
-            db.save_outline(nb_title, outline)
+            db.save_outline(nb_title, outline, outline_mode=outline_mode)
         else:
-            logger.info("已从数据库读取大纲缓存。")
+            logger.info(f"已从数据库读取大纲缓存 [{get_outline_mode_label(outline_mode)}]。")
             normalized_outline = enrich_outline_with_section_plans(outline, nb_title)
             if normalized_outline != outline:
                 outline = normalized_outline
-                db.save_outline(nb_title, outline)
+                db.save_outline(nb_title, outline, outline_mode=outline_mode)
             else:
                 outline = normalized_outline
 
@@ -595,7 +680,13 @@ async def main():
 
         if status.get("is_complete") and not args.force_regenerate:
             logger.info("检测到该笔记本所有小节均已生成完成，先进行质量检查，必要时自动重生成未通过小节。")
-            quality_report = export_all_views(db, nb_title, export_outline, is_final=False)
+            quality_report = export_all_views(
+                db,
+                nb_title,
+                export_outline,
+                is_final=False,
+                reference_sources=reference_sources,
+            )
             await rerun_failed_quality_sections(
                 client,
                 db,
@@ -603,8 +694,15 @@ async def main():
                 notebook_title=nb_title,
                 outline=export_outline,
                 initial_quality_report=quality_report,
+                reference_sources=reference_sources,
             )
-            export_all_views(db, nb_title, export_outline, is_final=True)
+            export_all_views(
+                db,
+                nb_title,
+                export_outline,
+                is_final=True,
+                reference_sources=reference_sources,
+            )
             return
         if status.get("is_complete") and args.force_regenerate:
             logger.info("已启用强制重生成：即使全部小节已完成，也会按当前提示词重新生成。")
@@ -642,12 +740,24 @@ async def main():
                     save_stage_progress=True,
                 ):
                     # 实时导出进度
-                    export_all_views(db, nb_title, export_outline, is_final=False)
+                    export_all_views(
+                        db,
+                        nb_title,
+                        export_outline,
+                        is_final=False,
+                        reference_sources=reference_sources,
+                    )
 
         # 4. 最终组装导出
         if scoped_run:
             logger.info("范围限定测试已完成，跳过整本完成度判定与整本级自动重生成。")
-            export_all_views(db, nb_title, export_outline, is_final=True)
+            export_all_views(
+                db,
+                nb_title,
+                export_outline,
+                is_final=True,
+                reference_sources=reference_sources,
+            )
             return
 
         final_status = db.get_generation_status(nb_title, outline)
@@ -658,11 +768,23 @@ async def main():
                 f"仍有 {len(missing)} 个小节未完成，本次先导出当前进度。"
                 + (f" 示例缺失项: {missing_preview}" if missing_preview else "")
             )
-            export_all_views(db, nb_title, outline, is_final=False)
+            export_all_views(
+                db,
+                nb_title,
+                outline,
+                is_final=False,
+                reference_sources=reference_sources,
+            )
             return
 
         logger.info("所有章节生成完毕，开始执行质量检查与未通过小节重生成...")
-        quality_report = export_all_views(db, nb_title, outline, is_final=False)
+        quality_report = export_all_views(
+            db,
+            nb_title,
+            outline,
+            is_final=False,
+            reference_sources=reference_sources,
+        )
         await rerun_failed_quality_sections(
             client,
             db,
@@ -670,9 +792,16 @@ async def main():
             notebook_title=nb_title,
             outline=outline,
             initial_quality_report=quality_report,
+            reference_sources=reference_sources,
         )
         logger.info("质量检查与重生成结束，开始导出最终 Markdown 文件...")
-        export_all_views(db, nb_title, outline, is_final=True)
+        export_all_views(
+            db,
+            nb_title,
+            outline,
+            is_final=True,
+            reference_sources=reference_sources,
+        )
 
     except Exception as e:
         logger.error(f"流水线执行过程中出现未捕获异常: {e}")

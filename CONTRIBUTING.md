@@ -85,18 +85,24 @@ entropy-note --notebook-title "<你的笔记本标题>" --chapter-index 1 --sect
 entropy-note-image-tasks --help
 ```
 
+查看图示后处理工具帮助：
+
+```bash
+entropy-note-render-visuals --help
+```
+
 ## 提交前检查
 
 至少执行以下检查：
 
 ```bash
-python -m py_compile main.py login.py run_image_tasks.py
+python -m py_compile main.py login.py run_image_tasks.py run_visual_postprocess.py
 ```
 
 如果你改了 `src/` 下的核心模块，建议再补跑：
 
 ```bash
-python -m py_compile src/config.py src/core/client.py src/core/quality.py src/db/manager.py src/prompts/markdown_prompts.py src/prompts/section_style.py src/utils/exporter.py src/utils/mermaid.py
+python -m py_compile src/config.py src/core/client.py src/core/quality.py src/db/manager.py src/prompts/markdown_prompts.py src/prompts/section_style.py src/utils/exporter.py src/utils/mermaid.py src/utils/visual_renderer.py
 ```
 
 如果你修改了打包或 CLI 入口，建议确认这些命令仍然可用：
@@ -105,6 +111,7 @@ python -m py_compile src/config.py src/core/client.py src/core/quality.py src/db
 entropy-note --help
 entropy-note-login --help
 entropy-note-image-tasks --help
+entropy-note-render-visuals --help
 ```
 
 ## 提交内容建议
@@ -114,6 +121,7 @@ entropy-note-image-tasks --help
 - 修复 NotebookLM 主流程中的稳定性问题
 - 改进结构化解析、质量检查与导出链路
 - 改进 Obsidian 友好的图示导出，尤其是 SVG / Mermaid
+- 改进已完成笔记本的独立后处理链路，例如图片写回与总索引状态更新
 - 完善 README、CI、开发文档与发布体验
 
 请尽量避免：

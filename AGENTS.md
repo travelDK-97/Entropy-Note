@@ -102,6 +102,9 @@ NotebookLM 返回慢是常态，不要因为等待时间长就直接判断为卡
   - 复用项目内的 `NOTEBOOKLM_HOME`
 - `run_image_tasks.py`
   - 图像任务后处理入口
+- `run_visual_postprocess.py`
+  - 已完成笔记本的图示后处理入口
+  - 负责 Mermaid / SVG 预渲染与 Markdown 图片写回
 
 ## 核心模块
 
@@ -119,6 +122,8 @@ NotebookLM 返回慢是常态，不要因为等待时间长就直接判断为卡
   - 各类 Markdown / 图示 / 质量报告导出
 - `src/utils/mermaid.py`
   - Mermaid 清洗与 Obsidian 兼容格式化
+- `src/utils/visual_renderer.py`
+  - 图示预渲染、SVG 资产落盘、Mermaid 转图片
 
 ## 数据结构
 
@@ -144,13 +149,15 @@ NotebookLM 返回慢是常态，不要因为等待时间长就直接判断为卡
 - 是否让 `guide-only` 再次误报缺失 warning
 - 是否把一次性手动提示词误塞进主链路文档
 - 是否引入本机绝对路径或私有资料名称
+- 是否破坏独立图示后处理后的 `_rendered_visuals/` 相对引用
+- 是否让 `00_总索引.md` 丢失图示后处理状态说明
 
 ## 最小验证路径
 
 ### 基础静态检查
 
 ```bash
-python -m py_compile main.py login.py run_image_tasks.py src\config.py src\core\client.py src\core\diagnostics.py src\core\image_jobs.py src\core\quality.py src\db\manager.py src\prompts\markdown_prompts.py src\prompts\section_style.py src\utils\exporter.py src\utils\mermaid.py
+python -m py_compile main.py login.py run_image_tasks.py run_visual_postprocess.py src\config.py src\core\client.py src\core\diagnostics.py src\core\image_jobs.py src\core\quality.py src\db\manager.py src\prompts\markdown_prompts.py src\prompts\section_style.py src\utils\exporter.py src\utils\mermaid.py src\utils\visual_renderer.py
 ```
 
 ### CLI 检查
@@ -159,6 +166,7 @@ python -m py_compile main.py login.py run_image_tasks.py src\config.py src\core\
 entropy-note --help
 entropy-note-login --help
 entropy-note-image-tasks --help
+entropy-note-render-visuals --help
 ```
 
 ### 代表性回归样本
@@ -173,6 +181,7 @@ entropy-note-image-tasks --help
 - 首判类型符合预期
 - 三阶段链路完整跑通
 - 质量报告无错误，警告可解释或已清零
+- 后处理后 `_rendered_visuals/` 成功写出，正文图示引用可在 Obsidian 中打开
 
 ## 修改风格建议
 

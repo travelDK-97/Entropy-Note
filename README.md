@@ -8,6 +8,16 @@
 
 如果你是后续继续接手此仓库的 agent 或自动化协作者，建议优先阅读 [AGENTS.md](AGENTS.md)。
 
+## v1.1 更新摘要
+
+这一版可以视为 `v1.1` 候选，重点不是再扩展花哨输出，而是把主链路补得更稳、更适合 Obsidian 长期使用：
+
+- 新增大纲模式切换：普通资料可继续按核心学习输出，法规/教材型资料可切到按资源正式目录输出。
+- 登录恢复链路修复：自动登录不再吞掉 `notebooklm login` 的终端确认步骤。
+- 分章文件页首统一补充生成说明，并在索引页 / 分章目录页补写参考文档来源。
+- 新增独立图示后处理命令：可在笔记本生成完成后，把 Mermaid / SVG 渲染成图片并写回 Markdown。
+- 总索引现在可以记录该笔记是否已经执行过图示后处理，以及图片写回模式和资产数量。
+
 ## 🌟 核心特性
 
 - **一键全自动**：自动读取 NotebookLM 中的资料，提取章节大纲，按章逐节生成学习资料。
@@ -15,6 +25,7 @@
 - **安全延时与重试**：内置安全等待、指数退避与质量重生成机制，优先保证稳定可跑。
 - **断点续传**：所有 Prompt、结构化响应和渲染结果都会实时写入 SQLite 数据库 (`study_guide.db`)。
 - **结构化知识资产**：除主文档外，还会保存结构化 block、质量报告、章节速查表与可渲染图示。
+- **独立图示后处理**：支持对已完成笔记本再次执行图示渲染，把 Mermaid / SVG 预处理成更适合 Obsidian 的图片资产并写回文档。
 - **学习优先模式**：默认优先导出快速学习指南、章节速查表、结构化资料、质量报告与可渲染图示；漫画、图像任务和发布功能默认保留但不启用。
 
 ## 🔗 与 `notebooklm-py` 的关系
@@ -128,6 +139,7 @@ python main.py --notebook-title "<你的笔记本标题>" --chapter-index 3 --fo
 ```text
 entropy-note/
 ├── main.py                     # [入口] 流程控制中心，支持整本/单章/强制重生成
+├── run_visual_postprocess.py   # [工具] 已完成笔记本的图示后处理与图片写回
 ├── run_image_tasks.py          # [工具] 读取图像任务 JSONL，生成可批量执行的提示词包
 ├── requirements.txt            # [依赖] 项目依赖清单
 ├── study_guide.db              # [数据] SQLite 数据库 (运行后自动生成)
@@ -143,7 +155,8 @@ entropy-note/
 │   ├── markdown_prompts.py # [提示词] 分阶段提示词、结构化解析与 block 合并
 │   └── section_style.py    # [判定] 判断小节偏文字/推导，以及是否需要图示
     └── utils/
-│   └── exporter.py         # [导出] 负责导出快速学习指南、速查表、结构化资料与图示
+│   ├── exporter.py         # [导出] 负责导出快速学习指南、速查表、结构化资料与图示
+│   └── visual_renderer.py  # [渲染] 负责 Mermaid / SVG 资产生成与图片写回支持
 ```
 
 ## 🚀 快速开始
@@ -181,6 +194,7 @@ $env:NOTEBOOKLM_HOME = ".notebooklm"
 entropy-note-login
 entropy-note --notebook-title "<你的笔记本标题>"
 entropy-note-image-tasks --dry-run
+entropy-note-render-visuals --help
 ```
 
 ### 2. 授权登录 Google 账号
@@ -220,6 +234,35 @@ entropy-note
 ```python
 LEARNING_FIRST_MODE = False
 ```
+
+### 3.1 生成完成后的图示后处理
+
+如果你希望把已经生成好的笔记再进一步处理成“图片写回 Markdown”的版本，可以在主流程跑完后额外执行：
+
+```bash
+python run_visual_postprocess.py --notebook-title "<你的笔记本标题>"
+# 或
+entropy-note-render-visuals --notebook-title "<你的笔记本标题>"
+```
+
+常见用法：
+
+```bash
+# 处理全部已完成笔记本
+python run_visual_postprocess.py --all
+
+# 保留图片和源码两份
+python run_visual_postprocess.py --notebook-title "<你的笔记本标题>" --embed-mode hybrid
+
+# 如果你在测试数据库快照
+python run_visual_postprocess.py --db-path "<数据库路径>" --notebook-title "<你的笔记本标题>"
+```
+
+执行后会：
+
+- 在 `outputs/<笔记本名>/_rendered_visuals/` 下生成 SVG 图片资产
+- 重写 `快速学习指南`、`结构化资料`、`可渲染图示` 及其分章版本中的图示引用
+- 自动更新 `00_总索引.md` 中的“图示后处理状态”说明
 
 ### 4. 批量准备图像任务
 

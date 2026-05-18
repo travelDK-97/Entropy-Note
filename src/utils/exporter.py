@@ -4,9 +4,11 @@ import logging
 import re
 import shutil
 from collections import OrderedDict
+from contextlib import nullcontext
 
-from src.config import OUTPUT_DIR
+from src.config import OUTPUT_DIR, RENDERABLE_VISUAL_EMBED_MODE, RENDERED_VISUALS_DIRNAME
 from src.utils.mermaid import format_obsidian_mermaid_code, sanitize_mermaid_code
+from src.utils.visual_renderer import MermaidSvgRenderer
 
 logger = logging.getLogger("MarkdownExporter")
 PAGE_BREAK_MARKER = '<div style="page-break-after: always;"></div>\n\n<!-- pagebreak -->'
@@ -15,6 +17,22 @@ FAST_GUIDE_CHAPTER_DIR = f"{FAST_GUIDE_NAME}_分章"
 CHEATSHEET_NAME = "章节速查表"
 CHEATSHEET_CHAPTER_DIR = f"{CHEATSHEET_NAME}_分章"
 QUALITY_REPORT_CHAPTER_DIR = "质量报告_分章"
+SOURCE_KIND_LABELS = {
+    "google_docs": "Google Docs",
+    "google_slides": "Google Slides",
+    "google_spreadsheet": "Google Sheets",
+    "pdf": "PDF",
+    "pasted_text": "粘贴文本",
+    "web_page": "网页",
+    "youtube": "YouTube",
+    "markdown": "Markdown",
+    "docx": "Word",
+    "csv": "CSV",
+    "epub": "EPUB",
+    "image": "图片",
+    "media": "媒体",
+    "unknown": "未知来源",
+}
 CHEATSHEET_GROUP_TITLES = {
     "definition": "定义速查",
     "theorem": "定理速查",
@@ -121,6 +139,31 @@ def _notebook_file_path(notebook_title: str, file_name: str) -> str:
     return os.path.join(_notebook_root_dir(notebook_title), file_name)
 
 
+def _rendered_visual_root_dir(notebook_title: str) -> str:
+    path = os.path.join(_notebook_root_dir(notebook_title), RENDERED_VISUALS_DIRNAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _rendered_visual_task_dir(notebook_title: str, task: dict) -> str:
+    chapter_dir = _safe_title(task["chapter_name"])
+    section_dir = _safe_title(task["section_name"])
+    path = os.path.join(_rendered_visual_root_dir(notebook_title), chapter_dir, section_dir)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _rendered_visual_file_name(task: dict, suffix: str = ".svg") -> str:
+    title = _safe_title(task.get("title") or "visual")
+    order = int(task.get("task_order") or 1)
+    return f"{order:02d}_{title}{suffix}"
+
+
+def _markdown_relpath(from_file_path: str, target_path: str) -> str:
+    rel = os.path.relpath(target_path, start=os.path.dirname(from_file_path))
+    return rel.replace("\\", "/")
+
+
 CHINESE_DIGITS = {
     "零": 0,
     "一": 1,
@@ -199,7 +242,100 @@ def _build_renderable_visual_lookup(structured_sections: list) -> dict[tuple[str
     return lookup
 
 
-def _write_renderable_visual_summary(f, tasks: list[dict]):
+def _write_svg_asset(file_path: str, svg_code: str) -> str:
+    svg = str(svg_code or "").strip()
+    if not svg:
+        return ""
+    with open(file_path, "w", encoding="utf-8") as asset_file:
+        asset_file.write(svg if svg.endswith("\n") else svg + "\n")
+    return file_path
+
+
+def prepare_rendered_visual_assets(notebook_title: str, structured_sections: list | None) -> dict[tuple[str, str], list[dict]]:
+    if not structured_sections or RENDERABLE_VISUAL_EMBED_MODE == "source_code":
+        return {}
+
+    section_lookup = _build_renderable_visual_lookup(structured_sections or [])
+    flat_tasks = [task for tasks in section_lookup.values() for task in tasks]
+    if not flat_tasks:
+        return {}
+
+    rendered_lookup: dict[tuple[str, str], list[dict]] = {}
+    has_mermaid = any(task.get("render_format") != "svg" for task in flat_tasks)
+
+    with MermaidSvgRenderer() if has_mermaid else nullcontext() as mermaid_renderer:
+        for task in flat_tasks:
+            section_key = (task["chapter_name"], task["section_name"])
+            rendered_task = dict(task)
+            asset_dir = _rendered_visual_task_dir(notebook_title, task)
+            asset_path = os.path.join(asset_dir, _rendered_visual_file_name(task))
+            asset_written = ""
+
+            if task.get("render_format") == "svg" and task.get("svg_code"):
+                asset_written = _write_svg_asset(asset_path, task["svg_code"])
+            elif task.get("mermaid_code") and getattr(mermaid_renderer, "available", False):
+                rendered_svg = mermaid_renderer.render_to_svg(task["mermaid_code"])
+                if rendered_svg:
+                    asset_written = _write_svg_asset(asset_path, rendered_svg)
+
+            if asset_written:
+                rendered_task["asset_path"] = asset_written
+                rendered_task["asset_format"] = "svg"
+
+            rendered_lookup.setdefault(section_key, []).append(rendered_task)
+
+    return rendered_lookup
+
+
+def _merge_rendered_visual_lookup(
+    visual_lookup: dict[tuple[str, str], list[dict]],
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None,
+) -> dict[tuple[str, str], list[dict]]:
+    if not rendered_visual_lookup:
+        return visual_lookup
+
+    merged: dict[tuple[str, str], list[dict]] = {}
+    for key, tasks in visual_lookup.items():
+        rendered_tasks = rendered_visual_lookup.get(key, [])
+        merged[key] = []
+        for idx, task in enumerate(tasks):
+            if idx < len(rendered_tasks):
+                merged[key].append(rendered_tasks[idx])
+            else:
+                merged[key].append(task)
+    return merged
+
+
+def _write_visual_asset_embed(f, task: dict, *, current_doc_path: str):
+    asset_path = str(task.get("asset_path", "")).strip()
+    if not asset_path:
+        return
+    rel_path = _markdown_relpath(current_doc_path, asset_path)
+    alt_text = task.get("title") or task.get("section_name") or "图示"
+    f.write(f"![{alt_text}]({rel_path})\n\n")
+
+
+def _write_visual_content(f, task: dict, *, current_doc_path: str | None = None):
+    mode = RENDERABLE_VISUAL_EMBED_MODE
+    has_asset = bool(task.get("asset_path")) and current_doc_path is not None
+
+    if mode in {"rendered_images", "hybrid"} and has_asset:
+        _write_visual_asset_embed(f, task, current_doc_path=current_doc_path)
+        if mode == "rendered_images":
+            return
+
+    if task.get("render_format") == "svg" and task.get("svg_code"):
+        _write_svg_block(f, task["svg_code"])
+    else:
+        _write_mermaid_block(f, task["mermaid_code"])
+
+
+def _write_renderable_visual_summary(
+    f,
+    tasks: list[dict],
+    *,
+    current_doc_path: str | None = None,
+):
     if not tasks:
         return
 
@@ -214,13 +350,16 @@ def _write_renderable_visual_summary(f, tasks: list[dict]):
             for note in task["notes"]:
                 f.write(f"- 说明: {note}\n")
         f.write(f"- 渲染类型: {task['visual_kind']}\n\n")
-        if task.get("render_format") == "svg" and task.get("svg_code"):
-            _write_svg_block(f, task["svg_code"])
-        else:
-            _write_mermaid_block(f, task["mermaid_code"])
+        _write_visual_content(f, task, current_doc_path=current_doc_path)
 
 
-def _write_chapter_index(bundle_dir: str, title: str, intro: str, chapters: list[dict]):
+def _write_chapter_index(
+    bundle_dir: str,
+    title: str,
+    intro: str,
+    chapters: list[dict],
+    reference_sources: list[dict] | None = None,
+):
     index_path = os.path.join(bundle_dir, "00_目录.md")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(f"# {title}\n\n")
@@ -230,7 +369,50 @@ def _write_chapter_index(bundle_dir: str, title: str, intro: str, chapters: list
             file_name = _chapter_file_name(idx, chapter["chapter_name"])
             section_count = len(chapter.get("sections", []))
             f.write(f"- [{chapter['chapter_name']}]({file_name}) ({section_count} 节)\n")
+        _write_reference_sources(f, reference_sources)
     return index_path
+
+
+def _write_export_status_note(f, *, is_final: bool, progress_message: str, final_message: str):
+    if not is_final:
+        f.write(f"> 🔄 {progress_message}\n\n")
+        return
+    f.write(f"> ✅ {final_message}\n\n")
+
+
+def _normalize_reference_sources(reference_sources: list[dict] | None) -> list[dict]:
+    normalized = []
+    seen = set()
+    for source in reference_sources or []:
+        title = str(source.get("title", "")).strip() or "未命名来源"
+        kind = str(source.get("type") or source.get("kind") or "").strip().lower()
+        url = str(source.get("url", "")).strip()
+        key = (title, kind, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "title": title,
+                "kind_label": SOURCE_KIND_LABELS.get(kind, kind or "未知来源"),
+                "url": url,
+            }
+        )
+    return normalized
+
+
+def _write_reference_sources(f, reference_sources: list[dict] | None):
+    sources = _normalize_reference_sources(reference_sources)
+    if not sources:
+        return
+    f.write("\n## 参考文档来源\n\n")
+    f.write("以下为当前 NotebookLM 笔记本中已接入的参考文档来源，便于回看引用出处。\n\n")
+    for source in sources:
+        line = f"- {source['title']}（{source['kind_label']}）"
+        if source["url"]:
+            line += f" - {source['url']}"
+        f.write(f"{line}\n")
+    f.write("\n")
 
 
 def _compact_text(text: str, *, limit: int = 140) -> str:
@@ -360,7 +542,12 @@ def export_cheatsheets(notebook_title: str, structured_sections: list, is_final:
     logger.info(f"📘 {CHEATSHEET_NAME}已导出至: {os.path.abspath(output_path)}")
 
 
-def export_cheatsheets_by_chapter(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_cheatsheets_by_chapter(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    reference_sources: list[dict] | None = None,
+):
     if not structured_sections:
         logger.warning("没有结构化内容可按章导出章节速查表。")
         return
@@ -368,7 +555,13 @@ def export_cheatsheets_by_chapter(notebook_title: str, structured_sections: list
     chapters = _group_structured_by_chapter(structured_sections)
     bundle_dir = _chapter_bundle_dir(notebook_title, CHEATSHEET_CHAPTER_DIR)
     intro = "按章拆分的速查表入口，适合快速检索本章的定义、定理、公式、推导与易错点。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - {CHEATSHEET_NAME}（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - {CHEATSHEET_NAME}（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     exported_any = False
     for idx, chapter in enumerate(chapters, start=1):
@@ -377,10 +570,12 @@ def export_cheatsheets_by_chapter(notebook_title: str, structured_sections: list
         section_written = 0
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}（{CHEATSHEET_NAME}）\n\n")
-            if not is_final:
-                f.write("> 🔄 本章速查表仍可能继续更新。\n\n")
-            else:
-                f.write("> ✅ 本章速查表已整理完毕，可用于快速定位公式、定理、定义和易错点。\n\n")
+            _write_export_status_note(
+                f,
+                is_final=is_final,
+                progress_message="本章速查表仍可能继续更新。",
+                final_message="本章速查表由 NotebookLM 与 Entropy Note 协同生成，可用于快速定位公式、定理、定义和易错点。",
+            )
 
             for section in chapter["sections"]:
                 section_name = section["section_name"]
@@ -434,6 +629,7 @@ def export_notebook_index(
     include_image_exports: bool = True,
     include_renderable_visuals: bool = True,
     include_cheatsheets: bool = True,
+    reference_sources: list[dict] | None = None,
 ):
     """导出笔记本级总索引首页，统一链接总文件、分章目录与质量报告。"""
     safe_title = _safe_title(notebook_title)
@@ -480,6 +676,8 @@ def export_notebook_index(
         f.write(f"- [质量报告（分章）]({QUALITY_REPORT_CHAPTER_DIR}/00_目录.md)\n")
         f.write("\n")
 
+        _write_reference_sources(f, reference_sources)
+
         if quality_report:
             f.write("## 质量摘要\n\n")
             f.write(f"- 小节总数: {quality_summary.get('section_count', 0)}\n")
@@ -523,6 +721,50 @@ def export_notebook_index(
             f.write("\n")
 
     logger.info(f"🗂️ 总索引首页已导出至: {os.path.abspath(index_path)}")
+    return index_path
+
+
+def update_notebook_index_postprocess_status(
+    notebook_title: str,
+    *,
+    embed_mode: str,
+    asset_count: int,
+    processed_section_count: int = 0,
+):
+    """在总索引中写入或更新图示后处理状态说明。"""
+    index_path = _notebook_file_path(notebook_title, "00_总索引.md")
+    status_block = (
+        "## 图示后处理状态\n\n"
+        "- 状态: 已执行独立图示后处理\n"
+        f"- 文档写回模式: `{embed_mode}`\n"
+        f"- 写入图示资产数: {asset_count}\n"
+        f"- 涉及小节数: {processed_section_count}\n"
+        "- 说明: 当前笔记的 Mermaid / SVG 已按后处理策略重写；图片资产位于 `_rendered_visuals/` 目录。\n\n"
+    )
+
+    if not os.path.exists(index_path):
+        with open(index_path, "w", encoding="utf-8") as f:
+            f.write(f"# {notebook_title} - 总索引\n\n")
+            f.write("这是当前笔记本的阅读入口页。\n\n")
+            f.write(status_block)
+        logger.info(f"🗂️ 已创建总索引并写入图示后处理状态: {os.path.abspath(index_path)}")
+        return index_path
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    section_pattern = re.compile(r"\n## 图示后处理状态\n[\s\S]*?(?=\n## |\Z)")
+    if section_pattern.search(content):
+        updated = section_pattern.sub("\n" + status_block.rstrip() + "\n", content, count=1)
+    elif "## 总文件\n\n" in content:
+        updated = content.replace("## 总文件\n\n", status_block + "## 总文件\n\n", 1)
+    else:
+        updated = content.rstrip() + "\n\n" + status_block
+
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(updated)
+
+    logger.info(f"🗂️ 已更新总索引中的图示后处理状态: {os.path.abspath(index_path)}")
     return index_path
 
 
@@ -664,6 +906,7 @@ def export_to_markdown(
     db_results: list,
     is_final: bool = False,
     structured_sections: list | None = None,
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None = None,
 ):
     """将数据库中的章节记录导出为一个完整的 Markdown 文件。
     支持在每节生成后实时覆盖保存。"""
@@ -674,7 +917,10 @@ def export_to_markdown(
 
     _cleanup_legacy_guide_exports(notebook_title)
     output_path = _notebook_file_path(notebook_title, f"{FAST_GUIDE_NAME}.md")
-    visual_lookup = _build_renderable_visual_lookup(structured_sections or [])
+    visual_lookup = _merge_rendered_visual_lookup(
+        _build_renderable_visual_lookup(structured_sections or []),
+        rendered_visual_lookup,
+    )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f"# {notebook_title} - {FAST_GUIDE_NAME}\n")
@@ -701,7 +947,11 @@ def export_to_markdown(
             # 如果大模型开头自带了 ## 节名，我们就不做特殊处理；如果没带，我们在生成提示词里已经要求它带上了。
             
             f.write(f"{clean_content}\n\n")
-            _write_renderable_visual_summary(f, visual_lookup.get((chapter_name, section_name), []))
+            _write_renderable_visual_summary(
+                f,
+                visual_lookup.get((chapter_name, section_name), []),
+                current_doc_path=output_path,
+            )
             f.write("---\n\n")
 
     if not is_final:
@@ -715,6 +965,8 @@ def export_to_markdown_by_chapter(
     db_results: list,
     is_final: bool = False,
     structured_sections: list | None = None,
+    reference_sources: list[dict] | None = None,
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None = None,
 ):
     """按章拆分导出快速学习指南，便于控制单文件体积。"""
     guide_rows = _build_fast_guide_rows(db_results, structured_sections)
@@ -725,9 +977,18 @@ def export_to_markdown_by_chapter(
     _cleanup_legacy_guide_exports(notebook_title)
     chapters = _group_plain_sections(guide_rows)
     bundle_dir = _chapter_bundle_dir(notebook_title, FAST_GUIDE_CHAPTER_DIR)
-    visual_lookup = _build_renderable_visual_lookup(structured_sections or [])
+    visual_lookup = _merge_rendered_visual_lookup(
+        _build_renderable_visual_lookup(structured_sections or []),
+        rendered_visual_lookup,
+    )
     intro = "按章节拆分的快速学习指南入口。生成仍以小节为最小单元，但阅读和检索以章为单位。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - {FAST_GUIDE_NAME}（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - {FAST_GUIDE_NAME}（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     for idx, chapter in enumerate(chapters, start=1):
         chapter_name = chapter["chapter_name"]
@@ -736,22 +997,30 @@ def export_to_markdown_by_chapter(
         output_path = os.path.join(bundle_dir, file_name)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}\n\n")
-            if not is_final:
-                f.write("> 🔄 本章内容仍可能继续更新。\n\n")
-            else:
-                f.write("> ✅ 本章已完成导出，可单独阅读与打印。\n\n")
+            _write_export_status_note(
+                f,
+                is_final=is_final,
+                progress_message="本章内容仍可能继续更新。",
+                final_message="本章内容由 NotebookLM 与 Entropy Note 协同生成，可单独阅读与打印。",
+            )
             for section in chapter["sections"]:
                 f.write(f"{section['content']}\n\n")
                 _write_renderable_visual_summary(
                     f,
                     visual_lookup.get((chapter_name, section["section_name"]), []),
+                    current_doc_path=output_path,
                 )
                 f.write("---\n\n")
 
     logger.info(f"📚 分章{FAST_GUIDE_NAME}已导出至: {os.path.abspath(bundle_dir)} (目录: {os.path.basename(index_path)})")
 
 
-def export_structured_blocks(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_structured_blocks(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None = None,
+):
     """按结构化 block 导出一份更适合后续加工的 Markdown 资料。"""
     if not structured_sections:
         logger.warning("没有结构化内容可导出。")
@@ -772,6 +1041,7 @@ def export_structured_blocks(notebook_title: str, structured_sections: list, is_
             chapter_name = section["chapter_name"]
             section_name = section["section_name"]
             blocks = section.get("blocks", [])
+            section_visuals = iter((rendered_visual_lookup or {}).get((chapter_name, section_name), []))
 
             if chapter_name != current_chapter:
                 if current_chapter is not None:
@@ -788,6 +1058,7 @@ def export_structured_blocks(notebook_title: str, structured_sections: list, is_
                     continue
                 f.write(f"### {title}\n")
                 if block.get("block_type") == "renderable_visual":
+                    rendered_task = next(section_visuals, None)
                     if payload.get("render_format"):
                         f.write(f"- 渲染格式: {payload['render_format']}\n")
                     if payload.get("visual_kind"):
@@ -804,12 +1075,8 @@ def export_structured_blocks(notebook_title: str, structured_sections: list, is_
                         f.write(f"- 说明: {item}\n")
                     if payload:
                         f.write("\n")
-                    svg_code = str(payload.get("svg_code", "")).strip()
-                    mermaid_code = str(payload.get("mermaid_code", "")).strip()
-                    if svg_code:
-                        _write_svg_block(f, svg_code)
-                    elif mermaid_code:
-                        _write_mermaid_block(f, mermaid_code)
+                    if rendered_task:
+                        _write_visual_content(f, rendered_task, current_doc_path=output_path)
                     elif content:
                         f.write(f"{content}\n\n")
                     continue
@@ -820,7 +1087,13 @@ def export_structured_blocks(notebook_title: str, structured_sections: list, is_
     logger.info(f"🧱 结构化资料已导出至: {os.path.abspath(output_path)}")
 
 
-def export_structured_blocks_by_chapter(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_structured_blocks_by_chapter(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    reference_sources: list[dict] | None = None,
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None = None,
+):
     """按章拆分导出结构化资料。"""
     if not structured_sections:
         logger.warning("没有结构化内容可按章导出。")
@@ -829,21 +1102,30 @@ def export_structured_blocks_by_chapter(notebook_title: str, structured_sections
     chapters = _group_structured_by_chapter(structured_sections)
     bundle_dir = _chapter_bundle_dir(notebook_title, "结构化资料_分章")
     intro = "按章拆分的结构化资料入口，适合顺序阅读和局部精修。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - 结构化资料（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - 结构化资料（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     for idx, chapter in enumerate(chapters, start=1):
         chapter_name = chapter["chapter_name"]
         output_path = os.path.join(bundle_dir, _chapter_file_name(idx, chapter_name))
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}（结构化）\n\n")
-            if not is_final:
-                f.write("> 🔄 本章结构化资料仍可能继续更新。\n\n")
-            else:
-                f.write("> ✅ 本章结构化资料已整理完毕。\n\n")
+            _write_export_status_note(
+                f,
+                is_final=is_final,
+                progress_message="本章结构化资料仍可能继续更新。",
+                final_message="本章结构化资料由 NotebookLM 与 Entropy Note 协同生成，已整理完毕。",
+            )
 
             for section in chapter["sections"]:
                 section_name = section["section_name"]
                 blocks = section.get("blocks", [])
+                section_visuals = iter((rendered_visual_lookup or {}).get((chapter_name, section_name), []))
                 f.write(f"## {section_name}\n\n")
                 for block in blocks:
                     title = (block.get("block_title") or block.get("block_type") or "未命名内容").strip()
@@ -853,6 +1135,7 @@ def export_structured_blocks_by_chapter(notebook_title: str, structured_sections
                         continue
                     f.write(f"### {title}\n")
                     if block.get("block_type") == "renderable_visual":
+                        rendered_task = next(section_visuals, None)
                         if payload.get("render_format"):
                             f.write(f"- 渲染格式: {payload['render_format']}\n")
                         if payload.get("visual_kind"):
@@ -869,12 +1152,8 @@ def export_structured_blocks_by_chapter(notebook_title: str, structured_sections
                             f.write(f"- 说明: {item}\n")
                         if payload:
                             f.write("\n")
-                        svg_code = str(payload.get("svg_code", "")).strip()
-                        mermaid_code = str(payload.get("mermaid_code", "")).strip()
-                        if svg_code:
-                            _write_svg_block(f, svg_code)
-                        elif mermaid_code:
-                            _write_mermaid_block(f, mermaid_code)
+                        if rendered_task:
+                            _write_visual_content(f, rendered_task, current_doc_path=output_path)
                         elif content:
                             f.write(f"{content}\n\n")
                         continue
@@ -992,7 +1271,12 @@ def export_comic_prompts(notebook_title: str, structured_sections: list, is_fina
     logger.info(f"🖼️ 漫画提示词已导出至: {os.path.abspath(output_path)}")
 
 
-def export_comic_prompts_by_chapter(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_comic_prompts_by_chapter(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    reference_sources: list[dict] | None = None,
+):
     """按章拆分导出漫画提示词。"""
     if not structured_sections:
         logger.warning("没有结构化内容可按章导出漫画提示词。")
@@ -1001,7 +1285,13 @@ def export_comic_prompts_by_chapter(notebook_title: str, structured_sections: li
     chapters = _group_structured_by_chapter(structured_sections)
     bundle_dir = _chapter_bundle_dir(notebook_title, "漫画提示词_分章")
     intro = "按章拆分的漫画提示词入口，便于按知识主线批量生成图像。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - 漫画提示词（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - 漫画提示词（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     exported_any = False
     for idx, chapter in enumerate(chapters, start=1):
@@ -1010,10 +1300,12 @@ def export_comic_prompts_by_chapter(notebook_title: str, structured_sections: li
         section_written = 0
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}（漫画提示词）\n\n")
-            if not is_final:
-                f.write("> 🔄 本章漫画提示词仍可能继续更新。\n\n")
-            else:
-                f.write("> ✅ 本章漫画提示词已整理完毕。\n\n")
+            _write_export_status_note(
+                f,
+                is_final=is_final,
+                progress_message="本章漫画提示词仍可能继续更新。",
+                final_message="本章漫画提示词由 NotebookLM 与 Entropy Note 协同生成，已整理完毕。",
+            )
 
             for section in chapter["sections"]:
                 section_name = section["section_name"]
@@ -1107,7 +1399,12 @@ def export_image_tasks(notebook_title: str, structured_sections: list, is_final:
     logger.info(f"🖼️ 图像任务已导出至: {os.path.abspath(output_path)}")
 
 
-def export_image_tasks_by_chapter(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_image_tasks_by_chapter(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    reference_sources: list[dict] | None = None,
+):
     """按章拆分导出图像任务。"""
     if not structured_sections:
         logger.warning("没有结构化内容可按章导出图像任务。")
@@ -1116,7 +1413,13 @@ def export_image_tasks_by_chapter(notebook_title: str, structured_sections: list
     chapters = _group_structured_by_chapter(structured_sections)
     bundle_dir = _chapter_bundle_dir(notebook_title, "图像任务_分章")
     intro = "按章拆分的图像任务入口，适合批量调用 Lovart、GPT Image 2、Banana Pro。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - 图像任务（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - 图像任务（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     exported_any = False
     for idx, chapter in enumerate(chapters, start=1):
@@ -1132,10 +1435,12 @@ def export_image_tasks_by_chapter(notebook_title: str, structured_sections: list
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}（图像任务）\n\n")
-            if not is_final:
-                f.write("> 🔄 本章图像任务仍可能继续更新。\n\n")
-            else:
-                f.write("> ✅ 本章图像任务已整理完毕。\n\n")
+            _write_export_status_note(
+                f,
+                is_final=is_final,
+                progress_message="本章图像任务仍可能继续更新。",
+                final_message="本章图像任务由 NotebookLM 与 Entropy Note 协同生成，已整理完毕。",
+            )
             for task in tasks:
                 f.write(f"## {task['section_name']} / {task['title']}\n\n")
                 f.write(f"- 任务类型: {task['image_kind']}\n")
@@ -1157,13 +1462,22 @@ def export_image_tasks_by_chapter(notebook_title: str, structured_sections: list
     logger.info(f"🖼️ 分章图像任务已导出至: {os.path.abspath(bundle_dir)} (目录: {os.path.basename(index_path)})")
 
 
-def export_renderable_visuals(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_renderable_visuals(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None = None,
+):
     """导出可直接渲染的图表/图示，支持 SVG 与 Mermaid。"""
     if not structured_sections:
         logger.warning("没有结构化内容可用于导出可渲染图示。")
         return
 
-    _, renderable_tasks = _collect_visual_exports(structured_sections)
+    visual_lookup = _merge_rendered_visual_lookup(
+        _build_renderable_visual_lookup(structured_sections),
+        rendered_visual_lookup,
+    )
+    renderable_tasks = [task for tasks in visual_lookup.values() for task in tasks]
     if not renderable_tasks:
         logger.warning("当前还没有可用的可渲染图示。")
         return
@@ -1193,16 +1507,19 @@ def export_renderable_visuals(notebook_title: str, structured_sections: list, is
                 for note in task["notes"]:
                     f.write(f"- 说明: {note}\n")
             f.write(f"- 渲染类型: {task['visual_kind']}\n\n")
-            if task.get("render_format") == "svg" and task.get("svg_code"):
-                _write_svg_block(f, task["svg_code"])
-            else:
-                _write_mermaid_block(f, task["mermaid_code"])
+            _write_visual_content(f, task, current_doc_path=output_path)
             f.write("---\n\n")
 
     logger.info(f"📊 可渲染图示已导出至: {os.path.abspath(output_path)}")
 
 
-def export_renderable_visuals_by_chapter(notebook_title: str, structured_sections: list, is_final: bool = False):
+def export_renderable_visuals_by_chapter(
+    notebook_title: str,
+    structured_sections: list,
+    is_final: bool = False,
+    reference_sources: list[dict] | None = None,
+    rendered_visual_lookup: dict[tuple[str, str], list[dict]] | None = None,
+):
     """按章拆分导出可渲染图示。"""
     if not structured_sections:
         logger.warning("没有结构化内容可按章导出可渲染图示。")
@@ -1211,7 +1528,13 @@ def export_renderable_visuals_by_chapter(notebook_title: str, structured_section
     chapters = _group_structured_by_chapter(structured_sections)
     bundle_dir = _chapter_bundle_dir(notebook_title, "可渲染图示_分章")
     intro = "按章拆分的可渲染图示入口，支持 SVG 与 Mermaid，便于直接在 Markdown 中预览。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - 可渲染图示（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - 可渲染图示（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     exported_any = False
     for idx, chapter in enumerate(chapters, start=1):
@@ -1219,7 +1542,13 @@ def export_renderable_visuals_by_chapter(notebook_title: str, structured_section
         output_path = os.path.join(bundle_dir, _chapter_file_name(idx, chapter_name))
         tasks = []
         for section in chapter["sections"]:
-            tasks.extend(_build_renderable_visual_tasks(chapter_name, section["section_name"], section.get("blocks", [])))
+            section_tasks = _build_renderable_visual_tasks(chapter_name, section["section_name"], section.get("blocks", []))
+            if rendered_visual_lookup:
+                section_tasks = _merge_rendered_visual_lookup(
+                    {(chapter_name, section["section_name"]): section_tasks},
+                    rendered_visual_lookup,
+                ).get((chapter_name, section["section_name"]), [])
+            tasks.extend(section_tasks)
         if not tasks:
             if os.path.exists(output_path):
                 os.remove(output_path)
@@ -1227,10 +1556,12 @@ def export_renderable_visuals_by_chapter(notebook_title: str, structured_section
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}（可渲染图示）\n\n")
-            if not is_final:
-                f.write("> 🔄 本章可渲染图示仍可能继续更新。\n\n")
-            else:
-                f.write("> ✅ 本章可渲染图示已整理完毕。\n\n")
+            _write_export_status_note(
+                f,
+                is_final=is_final,
+                progress_message="本章可渲染图示仍可能继续更新。",
+                final_message="本章可渲染图示由 NotebookLM 与 Entropy Note 协同生成，已整理完毕。",
+            )
             for task in tasks:
                 f.write(f"## {task['section_name']} / {task['title']}\n\n")
                 if task.get("render_goal"):
@@ -1241,10 +1572,7 @@ def export_renderable_visuals_by_chapter(notebook_title: str, structured_section
                     for note in task["notes"]:
                         f.write(f"- 说明: {note}\n")
                 f.write(f"- 渲染类型: {task['visual_kind']}\n\n")
-                if task.get("render_format") == "svg" and task.get("svg_code"):
-                    _write_svg_block(f, task["svg_code"])
-                else:
-                    _write_mermaid_block(f, task["mermaid_code"])
+                _write_visual_content(f, task, current_doc_path=output_path)
                 f.write("---\n\n")
         exported_any = True
 
@@ -1371,7 +1699,11 @@ def export_quality_report(notebook_title: str, quality_report: dict):
     logger.info(f"🩺 质量报告已导出至: {os.path.abspath(output_path)}")
 
 
-def export_quality_report_by_chapter(notebook_title: str, quality_report: dict):
+def export_quality_report_by_chapter(
+    notebook_title: str,
+    quality_report: dict,
+    reference_sources: list[dict] | None = None,
+):
     if not quality_report:
         logger.warning("没有质量报告可按章导出。")
         return
@@ -1388,7 +1720,13 @@ def export_quality_report_by_chapter(notebook_title: str, quality_report: dict):
     chapters = [{"chapter_name": name, "sections": data} for name, data in grouped.items()]
     bundle_dir = _chapter_bundle_dir(notebook_title, QUALITY_REPORT_CHAPTER_DIR)
     intro = "按章节拆分的质量报告入口，重点展示每节的首次判定、生成证据与建议回看项。"
-    index_path = _write_chapter_index(bundle_dir, f"{notebook_title} - 质量报告（分章）", intro, chapters)
+    index_path = _write_chapter_index(
+        bundle_dir,
+        f"{notebook_title} - 质量报告（分章）",
+        intro,
+        chapters,
+        reference_sources=reference_sources,
+    )
 
     for idx, chapter in enumerate(chapters, start=1):
         chapter_name = chapter["chapter_name"]
@@ -1402,6 +1740,12 @@ def export_quality_report_by_chapter(notebook_title: str, quality_report: dict):
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {notebook_title} - {chapter_name}（质量报告）\n\n")
+            _write_export_status_note(
+                f,
+                is_final=True,
+                progress_message="本章质量报告仍可能继续更新。",
+                final_message="本章质量报告由 NotebookLM 与 Entropy Note 协同生成，便于回看首次判定、生成证据与补强建议。",
+            )
             f.write(f"- 小节数: {section_count}\n")
             f.write(f"- 通过数: {passed_count}\n")
             f.write(f"- 错误数: {error_count}\n")

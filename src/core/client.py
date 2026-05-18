@@ -19,17 +19,25 @@ class SafeNotebookClient:
         self.client = None
         self.last_failure = None
 
-    async def _run_notebooklm_cli(self, args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+    async def _run_notebooklm_cli(
+        self,
+        args: list[str],
+        *,
+        timeout: int,
+        capture_output: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
 
         def _run():
-            return subprocess.run(
-                ["notebooklm", *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
+            kwargs = {
+                "args": ["notebooklm", *args],
+                "text": True,
+                "timeout": timeout,
+                "env": env,
+            }
+            if capture_output:
+                kwargs["capture_output"] = True
+            return subprocess.run(**kwargs)
 
         return await asyncio.to_thread(_run)
 
@@ -61,7 +69,8 @@ class SafeNotebookClient:
                 pass
 
         try:
-            result = await self._run_notebooklm_cli(["login"], timeout=180)
+            logger.warning("即将拉起 notebooklm 浏览器登录；请在浏览器完成登录后，回到当前终端按回车确认。")
+            result = await self._run_notebooklm_cli(["login"], timeout=180, capture_output=False)
         except Exception as e:
             diag = diagnose_exception(e, stage="notebooklm login")
             self.last_failure = diag
@@ -198,6 +207,36 @@ class SafeNotebookClient:
                     return await self._list_notebooks(allow_reauth=False)
             return []
 
+    async def get_notebook_metadata(self, notebook_id: str) -> dict | None:
+        return await self._get_notebook_metadata(notebook_id, allow_reauth=True)
+
+    async def _get_notebook_metadata(self, notebook_id: str, *, allow_reauth: bool) -> dict | None:
+        if not self.client:
+            return None
+        self.last_failure = None
+        try:
+            metadata = await self.client.notebooks.get_metadata(notebook_id)
+            return {
+                "id": metadata.id,
+                "title": metadata.title,
+                "sources": [
+                    {
+                        "title": source.title,
+                        "type": getattr(source.kind, "value", str(source.kind)),
+                        "url": source.url,
+                    }
+                    for source in metadata.sources
+                ],
+            }
+        except Exception as e:
+            diag = diagnose_exception(e, stage="get_notebook_metadata")
+            self.last_failure = diag
+            logger.error(f"获取笔记本来源元数据失败[{diag.failure_type.value}]: {diag.summary}\n建议: {diag.action}\n详情: {diag.details}")
+            if allow_reauth and diag.failure_type == FailureType.AUTH:
+                if await self._attempt_reauth() and await self._connect(allow_reauth=False):
+                    return await self._get_notebook_metadata(notebook_id, allow_reauth=False)
+            return None
+
     async def ask_with_retry(self, notebook_id: str, prompt: str) -> str:
         """带有防封号延时和错误重试的请求方法"""
         if not self.client: return ""
@@ -272,9 +311,57 @@ class SafeNotebookClient:
         logger.error("达到最大重试次数，请求彻底失败。")
         return ""
 
-    async def extract_outline(self, notebook_id: str) -> list:
-        """让大模型提取 JSON 格式的章节大纲，并暴力清洗结果"""
-        prompt = """请分析你所拥有的所有资料（包括教材和讲义），为我提取这门课的核心章节与小节目录，并在第一次大纲提取时就给出每个小节的学习类型判断。
+    def _build_outline_prompt(self, outline_mode: str = "core", reference_sources: list[dict] | None = None) -> str:
+        source_titles = [
+            str(item.get("title", "")).strip()
+            for item in (reference_sources or [])
+            if str(item.get("title", "")).strip()
+        ]
+        source_hint = ""
+        if source_titles:
+            preview = "；".join(source_titles[:12])
+            if len(source_titles) > 12:
+                preview += "；……"
+            source_hint = f"\n已接入的参考资料标题包括：{preview}\n如果其中存在教材目录、讲义目录、法规目录或正式章节标题，请优先参考这些资源。"
+
+        if outline_mode == "official_from_sources":
+            return f"""请分析你所拥有的所有资料（包括教材、讲义、法规与其他参考文档），优先从资源中的原始目录、正式章标题和正式节标题中提取这门课的完整正式章节与小节目录，并在第一次大纲提取时就给出每个小节的学习类型判断。{source_hint}
+要求：
+1. 优先提取正式目录中的章（Chapter）和节（Section），不要自行缩写、合并、改写或省略正式章节。
+2. 如果资料里存在目录页、教材目录、法规目录、讲义目录或章节标题，请优先以这些正式标题为准。
+3. 对法规、制度、附录前的重要正式章节，也要正常保留，不要因为“非核心”而省略。
+4. 对每个小节，你需要结合资料判断：
+   - `style`: 只能是 `text_heavy`、`formula_heavy`、`mixed`
+   - `derivation_needed`: 是否需要独立的严谨推导补充层
+   - `visual_needed`: 是否需要可渲染图示
+   - `visual_type`: 只能是 `none`、`svg_curve`、`svg_effect_decomposition`、`mermaid_flowchart`、`mermaid_structure`
+   - `visual_ratio`: 只能是 `square`、`landscape_4_3`、`landscape_16_9`
+   - `style_reason`: 用一句中文说明为什么这么判断
+   - `visual_reason`: 用一句中文说明为什么需要或不需要图示，以及为什么是这种图
+5. 必须输出为纯 JSON 格式的数组，数组中每个元素是一个对象，格式严格如下：
+[
+  {{
+    "chapter": "第一章：xxx",
+    "sections": ["1.1 节名称", "1.2 节名称"],
+    "section_plans": {{
+      "1.1 节名称": {{
+        "style": "text_heavy",
+        "derivation_needed": false,
+        "visual_needed": true,
+        "visual_type": "svg_curve",
+        "visual_ratio": "landscape_4_3",
+        "style_reason": "本节主要是概念关系与机制说明，公式不是主体。",
+        "visual_reason": "本节需要在坐标轴上展示曲线与均衡点，用 SVG 曲线图更直观且更适合控制比例。"
+      }}
+    }}
+  }}
+]
+6. `section_plans` 中的键必须与 `sections` 数组中的小节标题完全一致。
+7. 判断必须以资料主内容为准，不要只根据标题机械猜测。
+8. 微观/宏观经济学中凡是依赖坐标轴、曲线、预算线、无差异曲线、均衡点、替代效应/收入效应的内容，优先判断为 SVG 图，而不是流程框图。
+9. 绝对不要有任何多余的解释、寒暄或 Markdown 格式。"""
+
+        return """请分析你所拥有的所有资料（包括教材和讲义），为我提取这门课的核心章节与小节目录，并在第一次大纲提取时就给出每个小节的学习类型判断。
 要求：
 1. 提取核心的章（Chapter）以及每章下面的核心节（Section）。
 2. 对每个小节，你需要结合资料判断：
@@ -307,7 +394,11 @@ class SafeNotebookClient:
 5. 判断必须以资料主内容为准，不要只根据标题机械猜测。
 6. 微观/宏观经济学中凡是依赖坐标轴、曲线、预算线、无差异曲线、均衡点、替代效应/收入效应的内容，优先判断为 SVG 图，而不是流程框图。
 6. 绝对不要有任何多余的解释、寒暄或 Markdown 格式。"""
-        
+
+    async def extract_outline(self, notebook_id: str, *, outline_mode: str = "core", reference_sources: list[dict] | None = None) -> list:
+        """让大模型提取 JSON 格式的章节大纲，并暴力清洗结果"""
+        prompt = self._build_outline_prompt(outline_mode=outline_mode, reference_sources=reference_sources)
+
         raw_response = await self.ask_with_retry(notebook_id, prompt)
         if not raw_response:
             return []

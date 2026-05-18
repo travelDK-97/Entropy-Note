@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entropy-note"
-version = "0.1.0"
+version = "1.1.0"
 description = "Entropy Note: a NotebookLM-based study material pipeline for structured guides, SVG/Mermaid visuals, and quality reports."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,9 +34,10 @@ dependencies = [
 entropy-note = "main:cli"
 entropy-note-login = "login:main"
 entropy-note-image-tasks = "run_image_tasks:main"
+entropy-note-render-visuals = "run_visual_postprocess:main"
 
 [tool.setuptools]
-py-modules = ["main", "login", "run_image_tasks"]
+py-modules = ["main", "login", "run_image_tasks", "run_visual_postprocess"]
 
 [tool.setuptools.packages.find]
 where = ["."]

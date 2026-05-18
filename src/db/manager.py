@@ -8,7 +8,14 @@ from src.config import DB_PATH
 
 logger = logging.getLogger("DBManager")
 
+
+def _outline_cache_key(notebook_name: str, outline_mode: str = "core") -> str:
+    mode = (outline_mode or "core").strip() or "core"
+    return notebook_name if mode == "core" else f"{notebook_name}::outline_mode={mode}"
+
+
 class DatabaseManager:
+
     """管理 SQLite 数据库，记录 Prompt、Response 以及支持断点续传"""
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
@@ -80,12 +87,16 @@ class DatabaseManager:
         if column_name not in columns:
             cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
-    def get_outline(self, notebook_name: str) -> list:
+    def get_outline(self, notebook_name: str, outline_mode: str = "core") -> list:
         """从数据库中获取已缓存的大纲"""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT outline_json FROM outlines WHERE notebook_name=?", (notebook_name,))
+        cache_key = _outline_cache_key(notebook_name, outline_mode)
+        c.execute("SELECT outline_json FROM outlines WHERE notebook_name=?", (cache_key,))
         result = c.fetchone()
+        if not result and (outline_mode or "core") == "core":
+            c.execute("SELECT outline_json FROM outlines WHERE notebook_name=?", (notebook_name,))
+            result = c.fetchone()
         conn.close()
         if result:
             import json
@@ -95,24 +106,25 @@ class DatabaseManager:
                 return []
         return []
 
-    def save_outline(self, notebook_name: str, outline_list: list):
+    def save_outline(self, notebook_name: str, outline_list: list, outline_mode: str = "core"):
         """将大纲缓存到数据库"""
         import json
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         now_str = datetime.now().isoformat()
         outline_json = json.dumps(outline_list, ensure_ascii=False)
+        cache_key = _outline_cache_key(notebook_name, outline_mode)
         c.execute("INSERT OR REPLACE INTO outlines (notebook_name, outline_json, created_at) VALUES (?, ?, ?)",
-                  (notebook_name, outline_json, now_str))
+                  (cache_key, outline_json, now_str))
         conn.commit()
         conn.close()
-        logger.info(f"💾 大纲已缓存入库")
+        logger.info(f"💾 大纲已缓存入库 [{outline_mode}]")
 
     def delete_notebook_data(self, notebook_name: str):
         """仅清理指定笔记本的历史记录，不影响其他笔记本。"""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("DELETE FROM outlines WHERE notebook_name=?", (notebook_name,))
+        c.execute("DELETE FROM outlines WHERE notebook_name=? OR notebook_name LIKE ?", (notebook_name, f"{notebook_name}::outline_mode=%"))
         c.execute("DELETE FROM guides WHERE notebook_name=?", (notebook_name,))
         c.execute("DELETE FROM section_blocks WHERE notebook_name=?", (notebook_name,))
         c.execute("DELETE FROM section_runs WHERE notebook_name=?", (notebook_name,))
@@ -451,6 +463,22 @@ class DatabaseManager:
             "missing_sections": missing_pairs,
             "chapters": chapters,
         }
+
+    def list_notebook_titles(self) -> list[str]:
+        """列出数据库中已有内容的笔记本标题。"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT notebook_name FROM guides
+            UNION
+            SELECT notebook_name FROM section_runs
+            ORDER BY notebook_name COLLATE NOCASE ASC
+            """
+        )
+        rows = [row[0] for row in c.fetchall() if row and row[0]]
+        conn.close()
+        return rows
 
     def get_latest_section_run(self, notebook_name: str, chapter_name: str, section_name: str) -> dict | None:
         """获取某个小节最近一次生成记录。"""

@@ -22,5 +22,19 @@ PUBLISH_MAX_WARNING_COUNT = 12
 # False: 同时导出漫画提示词、图像任务、可渲染图示与发布闸门等增强文件。
 LEARNING_FIRST_MODE = True
 
+# 图示插入模式
+# source_code: 保持 Mermaid / SVG 源码块
+# rendered_images: 优先插入项目内预渲染图片，失败时回退源码块
+# hybrid: 同时插入图片与源码块
+RENDERABLE_VISUAL_EMBED_MODE = os.environ.get(
+    "ENTROPY_NOTE_VISUAL_EMBED_MODE",
+    "rendered_images",
+).strip().lower() or "rendered_images"
+if RENDERABLE_VISUAL_EMBED_MODE not in {"source_code", "rendered_images", "hybrid"}:
+    RENDERABLE_VISUAL_EMBED_MODE = "rendered_images"
+
+RENDERED_VISUALS_DIRNAME = "_rendered_visuals"
+MERMAID_RENDER_TIMEOUT_SECONDS = int(os.environ.get("ENTROPY_NOTE_MERMAID_RENDER_TIMEOUT", "25"))
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(NOTEBOOKLM_HOME, exist_ok=True)
